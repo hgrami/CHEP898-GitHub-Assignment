@@ -2,7 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
-
-./**/examples/*
-./**/data/*
-./**/instructions/*
+.DS_Store
+**/examples
+**/data
+**/instructions

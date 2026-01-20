@@ -1,0 +1,537 @@
+---
+title: 'Assignment 1: Data Wrangling and Visualization'
+author: "Hector Ramirez Asturias"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Setup and Data Loading
+
+This analysis examines the CAN-PATH (Canadian Partnership for Tomorrow's Health) synthetic data, exploring relationships between demographic factors and health outcomes.
+
+## Load Required Libraries
+
+```{r libraries}
+library(tidyverse)
+```
+
+## Load Data Files
+
+```{r load-data}
+# Load demographics data
+demographics <- read_csv("assignment1_can_path_demographics.csv")
+
+# Load health data
+health <- read_csv("assignment1_can_path_health.csv")
+
+# Display dimensions
+tibble(
+  Dataset = c("Demographics", "Health"),
+  Rows = c(nrow(demographics), nrow(health)),
+  Columns = c(ncol(demographics), ncol(health))
+)
+```
+
+## Initial Data Inspection
+
+```{r initial-inspection}
+# Preview demographics
+glimpse(demographics)
+
+# Preview health
+glimpse(health)
+```
+
+---
+
+# 2. Data Cleaning
+
+## 2.1 Demographics Dataset Cleaning
+
+### Check for Duplicates
+
+```{r demo-duplicates}
+# Check for duplicate IDs
+demo_duplicates <- demographics %>%
+  group_by(ID) %>%
+  filter(n() > 1)
+
+tibble(Metric = "Duplicate IDs in demographics", Count = nrow(demo_duplicates))
+```
+
+### Missing Values Analysis
+
+```{r demo-missing}
+summary(demographics)
+```
+
+### Validate SDC_GENDER
+
+```{r validate-gender}
+# SDC_GENDER should be 1 (Man) or 2 (Woman)
+demographics %>%
+  count(SDC_GENDER) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+
+# Check for invalid values
+invalid_gender <- demographics %>%
+  filter(!SDC_GENDER %in% c(1, 2, NA))
+
+tibble(Metric = "Invalid gender values", Count = nrow(invalid_gender))
+```
+
+### Validate SDC_INCOME
+
+```{r validate-income}
+# SDC_INCOME should be 1-8
+demographics %>%
+  count(SDC_INCOME) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+
+# Check for invalid values (outside 1-8 range)
+invalid_income <- demographics %>%
+  filter(!SDC_INCOME %in% c(1:8, NA))
+
+tibble(Metric = "Invalid income values", Count = nrow(invalid_income))
+```
+
+### Clean Demographics Data
+
+```{r clean-demographics}
+# Create cleaned demographics dataset
+demographics_clean <- demographics %>%
+  # Remove any duplicate IDs (keep first occurrence)
+  distinct(ID, .keep_all = TRUE) %>%
+  # Filter to valid gender values only
+  filter(SDC_GENDER %in% c(1, 2)) %>%
+  # Add descriptive labels using case_when
+  mutate(
+    Gender = case_when(
+      SDC_GENDER == 1 ~ "Man",
+      SDC_GENDER == 2 ~ "Woman"
+    ),
+    Income_Category = case_when(
+      SDC_INCOME == 1 ~ "1_Less than 10 000 $",
+      SDC_INCOME == 2 ~ "2_10 000 $ - 24 999 $",
+      SDC_INCOME == 3 ~ "3_25 000 $ - 49 999 $",
+      SDC_INCOME == 4 ~ "4_50 000 $ - 74 999 $",
+      SDC_INCOME == 5 ~ "5_75 000 $ - 99 999 $",
+      SDC_INCOME == 6 ~ "6_100 000 $ - 149 999 $",
+      SDC_INCOME == 7 ~ "7_150 000 $ - 199 999 $",
+      SDC_INCOME == 8 ~ "8_200 000 $ or more"
+    )
+  )
+
+# Verify recoding
+table(demographics_clean$SDC_GENDER, demographics_clean$Gender)
+table(demographics_clean$SDC_INCOME, demographics_clean$Income_Category)
+
+tibble(Metric = "Demographics after cleaning", Rows = nrow(demographics_clean))
+```
+
+---
+
+## 2.2 Health Dataset Cleaning
+
+### Check for Duplicates
+
+```{r health-duplicates}
+# Check for duplicate IDs
+health_duplicates <- health %>%
+  group_by(ID) %>%
+  filter(n() > 1)
+
+tibble(Metric = "Duplicate IDs in health", Count = nrow(health_duplicates))
+```
+
+### Missing Values Analysis
+
+```{r health-missing}
+summary(health)
+```
+
+### Validate Categorical Variables
+
+```{r validate-health-cat}
+# HS_GEN_HEALTH: Self-rated health (1 = Excellent to 5 = Poor)
+health %>%
+  count(HS_GEN_HEALTH) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+
+# DIS_ASTHMA_EVER: 0 = No, 1 = Yes, 2 = Don't know
+health %>%
+  count(DIS_ASTHMA_EVER) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+```
+
+### Identify Outliers in Physical Activity
+
+```{r pa-outliers}
+# Summary statistics for PA_TOTAL_SHORT
+pa_summary <- health %>%
+  filter(!is.na(PA_TOTAL_SHORT)) %>%
+  summarise(
+    Min = min(PA_TOTAL_SHORT),
+    Q1 = quantile(PA_TOTAL_SHORT, 0.25),
+    Median = median(PA_TOTAL_SHORT),
+    Mean = mean(PA_TOTAL_SHORT),
+    Q3 = quantile(PA_TOTAL_SHORT, 0.75),
+    Max = max(PA_TOTAL_SHORT),
+    SD = sd(PA_TOTAL_SHORT)
+  )
+
+pa_summary %>% print()
+
+# Calculate IQR and identify outliers
+IQR_val <- IQR(health$PA_TOTAL_SHORT, na.rm = TRUE)
+Q1 <- quantile(health$PA_TOTAL_SHORT, 0.25, na.rm = TRUE)
+Q3 <- quantile(health$PA_TOTAL_SHORT, 0.75, na.rm = TRUE)
+
+lower_bound <- Q1 - 1.5 * IQR_val
+upper_bound <- Q3 + 1.5 * IQR_val
+
+tibble(
+  Metric = c("Lower bound", "Upper bound"),
+  Value = c(lower_bound, upper_bound)
+)
+
+# Count outliers
+outliers <- health %>%
+  filter(!is.na(PA_TOTAL_SHORT)) %>%
+  filter(PA_TOTAL_SHORT < lower_bound | PA_TOTAL_SHORT > upper_bound)
+
+tibble(
+  Metric = c("Outliers identified", "Percentage of total"),
+  Value = c(nrow(outliers), round(nrow(outliers) / sum(!is.na(health$PA_TOTAL_SHORT)) * 100, 2))
+)
+```
+
+### Clean Health Data
+
+```{r clean-health}
+# Create cleaned health dataset
+health_clean <- health %>%
+  # Remove any duplicate IDs (keep first occurrence)
+  distinct(ID, .keep_all = TRUE) %>%
+  # Filter to valid general health values
+  filter(HS_GEN_HEALTH %in% 1:5 | is.na(HS_GEN_HEALTH)) %>%
+  # Filter to valid asthma values
+  filter(DIS_ASTHMA_EVER %in% c(0, 1, 2) | is.na(DIS_ASTHMA_EVER)) %>%
+  # Add descriptive labels using case_when
+  mutate(
+    General_Health = case_when(
+      HS_GEN_HEALTH == 1 ~ "1_Excellent",
+      HS_GEN_HEALTH == 2 ~ "2_Very Good",
+      HS_GEN_HEALTH == 3 ~ "3_Good",
+      HS_GEN_HEALTH == 4 ~ "4_Fair",
+      HS_GEN_HEALTH == 5 ~ "5_Poor"
+    ),
+    Asthma_History = case_when(
+      DIS_ASTHMA_EVER == 0 ~ "No",
+      DIS_ASTHMA_EVER == 1 ~ "Yes",
+      DIS_ASTHMA_EVER == 2 ~ "Don't Know"
+    )
+  )
+
+# Verify recoding
+table(health_clean$HS_GEN_HEALTH, health_clean$General_Health)
+table(health_clean$DIS_ASTHMA_EVER, health_clean$Asthma_History)
+
+tibble(Metric = "Health after cleaning", Rows = nrow(health_clean))
+```
+
+---
+
+# 3. Join Datasets
+
+## Perform Inner Join
+
+An **inner join** was used to combine the datasets on ID, retaining records present in both sources. This ensures complete data for analysis.
+
+```{r join-data}
+# Perform inner join on ID
+combined_data <- demographics_clean %>%
+  inner_join(health_clean, by = "ID")
+
+tibble(
+  Metric = c("Combined dataset rows", "Combined dataset columns"),
+  Value = c(nrow(combined_data), ncol(combined_data))
+)
+```
+
+## Verify Join Results
+
+```{r verify-join}
+# Check for records that didn't match
+demo_not_matched <- demographics_clean %>%
+  anti_join(health_clean, by = "ID")
+
+health_not_matched <- health_clean %>%
+  anti_join(demographics_clean, by = "ID")
+
+tibble(
+  Dataset = c("Demographics not matched", "Health not matched"),
+  Count = c(nrow(demo_not_matched), nrow(health_not_matched))
+)
+
+# Summary of combined data
+glimpse(combined_data)
+```
+
+## Data Quality Check Post-Join
+
+```{r post-join-quality}
+summary(combined_data)
+```
+
+---
+
+# 4. Descriptive Statistics
+
+## 4.1 Continuous Variables
+
+### Physical Activity (PA_TOTAL_SHORT)
+
+```{r stats-pa}
+summary(combined_data$PA_TOTAL_SHORT)
+```
+
+### Vegetable Consumption (NUT_VEG_QTY)
+
+```{r stats-veg}
+summary(combined_data$NUT_VEG_QTY)
+```
+
+### Fruit Consumption (NUT_FRUITS_QTY)
+
+```{r stats-fruit}
+summary(combined_data$NUT_FRUITS_QTY)
+```
+
+## 4.2 Categorical Variables
+
+### Gender Distribution
+
+```{r stats-gender}
+combined_data %>%
+  count(Gender) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+```
+
+### Income Distribution
+
+```{r stats-income}
+combined_data %>%
+  filter(!is.na(Income_Category)) %>%
+  count(Income_Category) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+```
+
+### General Health Distribution
+
+```{r stats-health}
+combined_data %>%
+  filter(!is.na(General_Health)) %>%
+  count(General_Health) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+```
+
+---
+
+# 5. Visualizations
+
+## 5.1 Physical Activity Distribution (Histogram)
+
+This histogram shows the distribution of total physical activity levels in the sample. The distribution is right-skewed, indicating most participants have low to moderate physical activity levels.
+
+```{r viz-histogram, fig.width=10, fig.height=6}
+pa_histogram <- ggplot(combined_data %>% filter(!is.na(PA_TOTAL_SHORT)), aes(x = PA_TOTAL_SHORT)) +
+  geom_histogram(binwidth = 500, fill = "#3498db", color = "white", alpha = 0.8) +
+  geom_vline(aes(xintercept = mean(PA_TOTAL_SHORT)),
+             color = "#e74c3c", linetype = "dashed", linewidth = 1) +
+  geom_vline(aes(xintercept = median(PA_TOTAL_SHORT)),
+             color = "#2ecc71", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Distribution of Total Physical Activity",
+    subtitle = "Red dashed line = Mean, Green dashed line = Median",
+    x = "Total Physical Activity (MET-minutes/week)",
+    y = "Frequency",
+    caption = "Source: CAN-PATH Data"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40"),
+    axis.title = element_text(size = 12)
+  ) +
+  scale_x_continuous(labels = scales::comma)
+plot(pa_histogram)
+```
+
+## 5.2 Income Distribution by Gender (Grouped Bar Chart)
+
+This grouped bar chart compares income distribution between males and females. This visualization compares income distributions across gender categories.
+
+```{r viz-bar, fig.width=12, fig.height=7}
+income_bar <- ggplot(combined_data %>% filter(!is.na(Income_Category) & !is.na(Gender)) %>%
+                       count(Income_Category, Gender),
+                     aes(x = Income_Category, y = n, fill = Gender)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.85) +
+  scale_fill_manual(values = c("Man" = "#3498db", "Woman" = "#e74c3c")) +
+  labs(
+    title = "Income Distribution by Gender",
+    subtitle = "Comparison of household income categories between men and women",
+    x = "Income Category",
+    y = "Count",
+    fill = "Gender",
+    caption = "Source: CAN-PATH Data"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40"),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+plot(income_bar)
+```
+
+## 5.3 Nutrition vs Physical Activity (Scatterplot)
+
+This scatterplot explores the relationship between fruit/vegetable consumption and physical activity, colored by general health status.
+
+```{r viz-scatter, fig.width=12, fig.height=8}
+# Create combined nutrition variable
+nutrition_scatter <- ggplot(combined_data %>%
+                              filter(!is.na(PA_TOTAL_SHORT) & !is.na(NUT_VEG_QTY) &
+                                     !is.na(NUT_FRUITS_QTY) & !is.na(General_Health)) %>%
+                              mutate(Total_FruitVeg = NUT_VEG_QTY + NUT_FRUITS_QTY),
+                            aes(x = Total_FruitVeg, y = PA_TOTAL_SHORT, color = General_Health)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, aes(group = General_Health), linewidth = 1) +
+  scale_color_manual(values = c("1_Excellent" = "#27ae60",
+                                "2_Very Good" = "#3498db",
+                                "3_Good" = "#f39c12",
+                                "4_Fair" = "#e67e22",
+                                "5_Poor" = "#e74c3c")) +
+  labs(
+    title = "Relationship Between Nutrition and Physical Activity",
+    subtitle = "Total fruit/vegetable consumption vs. physical activity by self-rated health",
+    x = "Total Daily Fruit + Vegetable Servings",
+    y = "Total Physical Activity (MET-minutes/week)",
+    color = "Self-Rated Health",
+    caption = "Source: CAN-PATH Data"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40"),
+    axis.title = element_text(size = 12),
+    legend.position = "right"
+  ) +
+  scale_y_continuous(labels = scales::comma)
+plot(nutrition_scatter)
+```
+
+## 5.4 Physical Activity by Income Category (Boxplot)
+
+This boxplot shows the distribution of physical activity across income categories.
+
+```{r viz-boxplot, fig.width=12, fig.height=7}
+pa_boxplot <- ggplot(combined_data %>% filter(!is.na(PA_TOTAL_SHORT) & !is.na(Income_Category)),
+                     aes(x = Income_Category, y = PA_TOTAL_SHORT, fill = Income_Category)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    title = "Physical Activity Distribution by Income Category",
+    subtitle = "Higher income groups may show different physical activity patterns",
+    x = "Income Category",
+    y = "Total Physical Activity (MET-minutes/week)",
+    caption = "Source: CAN-PATH Data"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40"),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  scale_y_continuous(labels = scales::comma)
+plot(pa_boxplot)
+```
+
+## 5.5 Health Status by Gender (Faceted Plot)
+
+```{r viz-facet, fig.width=12, fig.height=6}
+health_facet <- ggplot(combined_data %>%
+                         filter(!is.na(General_Health) & !is.na(Gender)) %>%
+                         count(Gender, General_Health) %>%
+                         group_by(Gender) %>%
+                         mutate(Percentage = n / sum(n) * 100),
+                       aes(x = General_Health, y = Percentage, fill = General_Health)) +
+  geom_bar(stat = "identity", alpha = 0.85) +
+  facet_wrap(~Gender) +
+  scale_fill_manual(values = c("1_Excellent" = "#27ae60",
+                               "2_Very Good" = "#3498db",
+                               "3_Good" = "#f39c12",
+                               "4_Fair" = "#e67e22",
+                               "5_Poor" = "#e74c3c")) +
+  labs(
+    title = "Self-Rated Health Distribution by Gender",
+    subtitle = "Percentage of participants in each health category",
+    x = "Self-Rated Health",
+    y = "Percentage (%)",
+    caption = "Source: CAN-PATH Data"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40"),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+plot(health_facet)
+```
+
+---
+
+# 6. Summary and Findings
+
+## Data Processing Summary
+- The demographics dataset contained `r nrow(demographics)` observations with variables for gender and income
+- The health dataset contained `r nrow(health)` observations with physical activity, nutrition, and health status measures
+- After cleaning and joining, `r nrow(combined_data)` records were retained. Several variables contain missing values (e.g., income and physical activity), which were handled using available-case analysis for descriptive summaries and plots.
+
+## Sample Characteristics
+- The sample is predominantly women (`r round(sum(combined_data$Gender == "Woman") / nrow(combined_data) * 100, 1)`%)
+- Income distribution across categories is shown in the descriptive statistics section
+
+## Variable Distributions
+- Physical activity (PA_TOTAL_SHORT) shows a right-skewed distribution, as visualized in the histogram
+- The descriptive statistics and visualizations provide an overview of the distributions for all continuous and categorical variables
+
+## Limitations
+- This is a descriptive analysis only; no inferential statistics or hypothesis testing were performed
+- Cross-sectional data cannot establish temporal relationships or causation
+- Analyses were primarily conducted using available observations for each variable/plot (pairwise/available-case), which may affect comparability across summaries if missing data is systematic.
+- Self-reported measures (physical activity, nutrition) may be subject to recall bias and social desirability bias
+- The synthetic nature of this dataset limits external validity
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
