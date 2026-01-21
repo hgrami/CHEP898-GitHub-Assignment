@@ -47,7 +47,7 @@ For the main work (including my data wrangling assignment):
 
 I also cloned the **class GitHub assignment repository**, added a gif representing my experience with this assignment, and submitted a **pull request**.
 
-- **Pull request link:** *<placeholder>*
+- **Pull request link:** *https://github.com/walkabilly/github_playground/pull/15*
 
 ## Experience Notes (What I Learned / What Hurt)
 
@@ -61,7 +61,7 @@ A few things that stood out while doing this:
 ## Links
 
 - **My GitHub repository:** `https://github.com/hgrami/CHEP898-GitHub-Assignment`
-- **Class repo pull request:** `<placeholder>`
+- **Class repo pull request:** `https://github.com/walkabilly/github_playground/pull/15`
 
 ## Requirements Checklist
 
@@ -70,5 +70,5 @@ A few things that stood out while doing this:
 - [x] Public repo created  
 - [x] Repo cloned into an RStudio project  
 - [x] README added describing repo + experience  
-- [] At least one additional file committed and pushed  
-- [] Class repo cloned, gif added, PR submitted  
+- [x] At least one additional file committed and pushed  
+- [x] Class repo cloned, gif added, PR submitted  
