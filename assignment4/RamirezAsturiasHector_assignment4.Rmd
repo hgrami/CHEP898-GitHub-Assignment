@@ -1,0 +1,447 @@
+---
+title: "Assignment 4: Independent Analysis Part 1 - Human Activity Recognition"
+author: "Hector Ramirez Asturias"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: cosmo
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999)
+```
+
+## 1. Introduction
+
+### Why I Chose This Dataset
+
+The UCI Human Activity Recognition dataset captures objective physical activity from the same accelerometer and gyroscope sensors used in fitness trackers, rather than relying on self-report questionnaires. It provides six labeled activities suitable for classification, 561 pre-computed features that allow for dimensionality reduction, and a clean, pre-processed structure. Smartphone-based activity recognition is already deployed in consumer health applications, which gives the classification task practical relevance beyond the classroom.
+
+### Health Science Relevance
+
+Accurate activity classification from wearable sensors supports objective physical activity measurement in epidemiological studies, fall detection for elderly care, rehabilitation monitoring, and sedentary behavior research. The six activities in this dataset span three dynamic (walking variations) and three static postures (sitting, standing, laying), which map onto common distinctions in physical activity research.
+
+### Dataset Overview
+
+The data comes from an experiment with 30 volunteers (ages 19-48) wearing a Samsung Galaxy S II smartphone at the waist. Each person performed six activities while the embedded accelerometer and gyroscope recorded 3-axial linear acceleration and angular velocity at 50Hz. The signals were pre-processed with noise filters, then segmented into 2.56-second windows with 50% overlap. From each window, 561 features were extracted.
+
+| Characteristic | Value |
+|----------------|-------|
+| Source | UCI Machine Learning Repository |
+| Download | https://archive.ics.uci.edu/dataset/240/human+activity+recognition+using+smartphones |
+| Subjects | 30 volunteers |
+| Activities | 6 (WALKING, WALKING_UPSTAIRS, WALKING_DOWNSTAIRS, SITTING, STANDING, LAYING) |
+| Features | 561 time/frequency domain variables |
+| Observations | 10,299 (7,352 train + 2,947 test) |
+| Missing values | None |
+
+## 2. Analysis Plan
+
+### Research Question
+
+Can we accurately classify physical activities from smartphone sensor data, and which features contribute most to distinguishing between activities?
+
+### Planned Analysis for Part 2
+
+The second part of this project will focus on:
+
+1. Training classification models using tidymodels, with Random Forest as the primary model and logistic regression or KNN as baselines for comparison
+2. Evaluating model performance using accuracy, sensitivity, specificity per class, confusion matrix, and ROC-AUC
+3. Analyzing feature importance to identify which sensor features drive classification, and exploring PCA for dimensionality reduction before modeling
+
+### Course Components
+
+This project incorporates GitHub for version control and documentation, tidyverse for data wrangling across multiple source files, ggplot2 for visualizing activity and feature distributions, and tidymodels (Part 2) for the classification workflow.
+
+### Steps for This Assignment
+
+1. Load the multiple data files (train/test split, labels, subject IDs)
+2. Merge into a single analysis-ready dataset
+3. Assign meaningful column names from features.txt
+4. Convert activity codes to descriptive labels
+5. Verify data structure and check for issues
+6. Generate descriptive statistics
+7. Create visualizations of activity and feature distributions
+
+## 3. Setup
+
+```{r libraries}
+library(tidyverse)
+library(knitr)
+library(gtsummary)
+library(corrr)
+
+# Set seed for reproducibility
+set.seed(10)
+```
+
+## 4. Data Loading
+
+The UCI HAR dataset is spread across multiple files that need to be combined. The main components are:
+
+- `features.txt`: Names for the 561 feature columns
+- `activity_labels.txt`: Mapping from activity codes (1-6) to names
+- `train/` and `test/` folders: Each contains X (features), y (activity), and subject files
+
+### Load Feature Names and Activity Labels
+
+```{r load-metadata}
+# Feature names (561 features)
+features <- read_table("data/UCI_HAR_Dataset/features.txt",
+                       col_names = c("feature_id", "feature_name"))
+
+head(features, 10)
+```
+
+**Number of features:** `r nrow(features)`
+
+```{r load-metadata-2}
+# Activity labels
+activity_labels <- read_table("data/UCI_HAR_Dataset/activity_labels.txt",
+                              col_names = c("activity_id", "activity_name"))
+
+activity_labels
+```
+
+### Load Training Data
+
+```{r load-train}
+# Training feature data (7352 rows x 561 columns)
+X_train <- read_table("data/UCI_HAR_Dataset/train/X_train.txt",
+                      col_names = FALSE)
+
+# Training activity labels
+y_train <- read_table("data/UCI_HAR_Dataset/train/y_train.txt",
+                      col_names = "activity_id")
+
+# Training subject IDs
+subject_train <- read_table("data/UCI_HAR_Dataset/train/subject_train.txt",
+                            col_names = "subject_id")
+
+```
+
+**Training data:** `r nrow(X_train)` rows × `r ncol(X_train)` columns
+
+### Load Test Data
+
+```{r load-test}
+# Test feature data (2947 rows x 561 columns)
+X_test <- read_table("data/UCI_HAR_Dataset/test/X_test.txt",
+                     col_names = FALSE)
+
+# Test activity labels
+y_test <- read_table("data/UCI_HAR_Dataset/test/y_test.txt",
+                     col_names = "activity_id")
+
+# Test subject IDs
+subject_test <- read_table("data/UCI_HAR_Dataset/test/subject_test.txt",
+                           col_names = "subject_id")
+
+```
+
+**Test data:** `r nrow(X_test)` rows × `r ncol(X_test)` columns
+
+## 5. Data Wrangling
+
+### Assign Feature Names
+
+The feature names contain characters that are not valid in R column names (parentheses, commas, hyphens). These were cleaned to produce syntactically valid names.
+
+```{r assign-feature-names}
+# Clean feature names: replace problematic characters
+clean_names <- features$feature_name %>%
+  str_replace_all("\\(\\)", "") %>%           # Remove ()
+  str_replace_all("\\(", "_") %>%             # Replace ( with _
+  str_replace_all("\\)", "") %>%              # Remove )
+  str_replace_all(",", "_") %>%               # Replace , with _
+  str_replace_all("-", "_") %>%               # Replace - with _
+  make.names(unique = TRUE)                   # Ensure unique valid names
+
+# Apply names to feature data
+colnames(X_train) <- clean_names
+colnames(X_test) <- clean_names
+```
+
+**Original features:** `r length(features$feature_name)` | **Unique clean names:** `r length(unique(clean_names))`
+
+### Combine Training and Test Sets
+
+```{r combine-data}
+# Combine training data
+train_data <- bind_cols(
+  subject_id = subject_train$subject_id,
+  activity_id = y_train$activity_id,
+  X_train
+) %>%
+  mutate(dataset = "train")
+
+# Combine test data
+test_data <- bind_cols(
+  subject_id = subject_test$subject_id,
+  activity_id = y_test$activity_id,
+  X_test
+) %>%
+  mutate(dataset = "test")
+
+# Merge into single dataset
+har_data <- bind_rows(train_data, test_data)
+
+```
+
+**Combined dataset:** `r nrow(har_data)` rows × `r ncol(har_data)` columns
+
+### Add Activity Labels
+
+```{r add-activity-labels}
+# Join activity names
+har_data <- har_data %>%
+  left_join(activity_labels, by = "activity_id") %>%
+  mutate(activity = factor(activity_name)) %>%
+  select(-activity_name)
+
+# Verify the recode
+table(har_data$activity_id, har_data$activity, useNA = "ifany")
+```
+
+### Convert Subject ID to Factor
+
+```{r convert-subject}
+har_data <- har_data %>%
+  mutate(subject_id = factor(subject_id))
+
+```
+
+**Number of subjects:** `r length(levels(har_data$subject_id))`
+
+### Check for Missing Values
+
+```{r check-missing}
+# Count missing values per column
+missing_counts <- colSums(is.na(har_data))
+missing_summary <- sum(missing_counts)
+
+```
+
+**Total missing values:** `r missing_summary`
+
+The dataset contains no missing values. The original researchers pre-processed and cleaned the sensor data before release.
+
+### Final Data Structure
+
+**Final dataset:** `r nrow(har_data)` rows × `r ncol(har_data)` columns
+
+**Column types:**
+
+- subject_id: factor (`r length(levels(har_data$subject_id))` levels)
+- activity_id: numeric (1-6)
+- activity: factor (`r length(levels(har_data$activity))` levels)
+- dataset: character (train/test)
+- 561 numeric feature columns
+
+```{r data-structure}
+# Preview first few columns
+har_data %>%
+  select(subject_id, activity_id, activity, dataset, 1:5) %>%
+  head(10) %>%
+  kable()
+```
+
+## 6. Descriptive Statistics
+
+### Activity Distribution
+
+```{r activity-distribution}
+# Overall activity counts
+activity_summary <- har_data %>%
+  count(activity) %>%
+  mutate(percent = round(n / sum(n) * 100, 1))
+
+activity_summary %>%
+  kable(col.names = c("Activity", "Count", "Percent (%)"),
+        caption = "Distribution of Activities")
+```
+
+Activity frequencies range from 15.9% (standing) to 18.3% (laying), indicating no severe class imbalance that would require correction.
+
+### Activity Distribution by Dataset
+
+```{r activity-by-dataset}
+har_data %>%
+  count(dataset, activity) %>%
+  pivot_wider(names_from = dataset, values_from = n) %>%
+  mutate(total = train + test) %>%
+  kable(caption = "Activity Counts by Train/Test Split")
+```
+
+### Subject Participation
+
+```{r subject-participation}
+# Observations per subject
+subject_summary <- har_data %>%
+  count(subject_id) %>%
+  summarise(
+    min_obs = min(n),
+    max_obs = max(n),
+    mean_obs = round(mean(n), 0),
+    median_obs = median(n)
+  )
+
+subject_summary %>%
+  kable(caption = "Observations per Subject")
+```
+
+Each subject contributed between `r subject_summary$min_obs` and `r subject_summary$max_obs` observations, with a median of `r subject_summary$median_obs`.
+
+### Sample Feature Statistics
+
+With 561 features, the table below shows summary statistics for a representative subset: the mean and standard deviation of body acceleration in each axis (time domain).
+
+```{r feature-summary}
+# Select a few representative features for summary
+sample_features <- c("tBodyAcc_mean_X", "tBodyAcc_mean_Y", "tBodyAcc_mean_Z",
+                     "tBodyAcc_std_X", "tBodyAcc_std_Y", "tBodyAcc_std_Z")
+
+har_data %>%
+  select(all_of(sample_features)) %>%
+  tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = all_continuous() ~ 3,
+    label = list(
+      tBodyAcc_mean_X ~ "Body Acc Mean X",
+      tBodyAcc_mean_Y ~ "Body Acc Mean Y",
+      tBodyAcc_mean_Z ~ "Body Acc Mean Z",
+      tBodyAcc_std_X ~ "Body Acc Std X",
+      tBodyAcc_std_Y ~ "Body Acc Std Y",
+      tBodyAcc_std_Z ~ "Body Acc Std Z"
+    )
+  ) %>%
+  modify_caption("**Sample Feature Statistics (Body Acceleration)**")
+```
+
+The body acceleration features are normalized between -1 and 1 (per the dataset documentation). The X-axis mean is approximately 0.27, while Y and Z are close to zero, consistent with the phone being worn horizontally at the waist.
+
+## 7. Visualizations
+
+### Visualization 1: Activity Distribution
+
+```{r viz-activity-dist, fig.width=10, fig.height=6}
+ggplot(har_data, aes(x = activity, fill = activity)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Activities in the HAR Dataset",
+    subtitle = "10,299 observations across 6 activity types",
+    x = "Activity",
+    y = "Count"
+  ) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Visualization 2: Body Acceleration by Activity
+
+This boxplot compares body acceleration (mean) across the six activity types for each axis.
+
+```{r viz-acceleration, fig.width=12, fig.height=6}
+har_data %>%
+  select(activity, tBodyAcc_mean_X, tBodyAcc_mean_Y, tBodyAcc_mean_Z) %>%
+  pivot_longer(cols = starts_with("tBodyAcc"),
+               names_to = "axis",
+               values_to = "acceleration") %>%
+  mutate(axis = str_replace(axis, "tBodyAcc_mean_", "")) %>%
+  ggplot(aes(x = activity, y = acceleration, fill = activity)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~axis, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  labs(
+    title = "Body Acceleration by Activity Type",
+    subtitle = "Mean acceleration in X, Y, and Z axes (normalized values)",
+    x = "Activity",
+    y = "Mean Acceleration"
+  ) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+On the X-axis, laying has the lowest values, sitting and standing cluster together, and walking activities are intermediate. The Y and Z axes show less variation, though laying remains distinct.
+
+### Visualization 3: Feature Correlation Heatmap
+
+This correlation matrix examines the relationships among a subset of acceleration and gyroscope features.
+
+```{r viz-correlation, fig.width=10, fig.height=8}
+# Select body acceleration and gyroscope features (means and stds)
+cor_features <- c("tBodyAcc_mean_X", "tBodyAcc_mean_Y", "tBodyAcc_mean_Z",
+                  "tBodyAcc_std_X", "tBodyAcc_std_Y", "tBodyAcc_std_Z",
+                  "tBodyGyro_mean_X", "tBodyGyro_mean_Y", "tBodyGyro_mean_Z",
+                  "tBodyGyro_std_X", "tBodyGyro_std_Y", "tBodyGyro_std_Z")
+
+# Compute correlation matrix
+cor_matrix <- har_data %>%
+  select(all_of(cor_features)) %>%
+  correlate()
+
+# Visualize
+cor_matrix %>%
+  rearrange() %>%
+  shave() %>%
+  rplot(print_cor = TRUE) +
+  theme_minimal() +
+  labs(title = "Correlation Matrix: Acceleration and Gyroscope Features") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8))
+```
+
+The acceleration standard deviations correlate moderately with each other (r = 0.3-0.5), as they all measure variability in movement. The acceleration means show weaker correlations. Gyroscope features form their own cluster, largely independent of the acceleration measures.
+
+### Visualization 4: Activity Patterns by Subject
+
+```{r viz-subject-activity, fig.width=12, fig.height=8}
+har_data %>%
+  count(subject_id, activity) %>%
+  ggplot(aes(x = subject_id, y = activity, fill = n)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(
+    title = "Observation Counts by Subject and Activity",
+    subtitle = "All 30 subjects performed all 6 activities",
+    x = "Subject ID",
+    y = "Activity",
+    fill = "Observations"
+  )
+```
+
+All 30 subjects performed all six activities. The number of observations per subject-activity combination ranges from approximately 30 to 90, reflecting differences in activity duration during the experiment.
+
+## 8. Summary and Next Steps
+
+### Key Observations
+
+The combined dataset contains 10,299 observations across 30 subjects performing 6 activities, with 561 sensor-derived features and no missing values. Activity classes are balanced (15.9% to 18.3%), so class imbalance correction is not necessary.
+
+Body acceleration differs between activity types, especially on the X-axis, where static activities (sitting, standing, laying) separate from dynamic ones (walking variations). Feature correlations indicate some redundancy among acceleration standard deviations, which could inform feature selection or dimensionality reduction in Part 2.
+
+### Plan for Part 2
+
+The next assignment will use the existing train/test split (70/30) for model evaluation, build a Random Forest classifier using tidymodels, and evaluate performance with a confusion matrix and per-class metrics. Feature importance analysis will identify the key predictors, and simpler models (logistic regression, KNN) may be included for comparison.
+
+The separation visible in the acceleration boxplots suggests that overall classification accuracy should be high, though distinguishing between similar activities (sitting vs. standing, walking upstairs vs. downstairs) will likely be more difficult.
+
+## References
+
+1. Anguita D, Ghio A, Oneto L, Parra X, Reyes-Ortiz JL. A public domain dataset for human activity recognition using smartphones. In: Proceedings of the 21st European Symposium on Artificial Neural Networks, Computational Intelligence and Machine Learning (ESANN 2013); 2013 Apr 24-26; Bruges, Belgium. p. 437-42. Available from: https://archive.ics.uci.edu/dataset/240/human+activity+recognition+using+smartphones
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
