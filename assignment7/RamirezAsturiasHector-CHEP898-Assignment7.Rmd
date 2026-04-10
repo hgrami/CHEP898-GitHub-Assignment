@@ -1,0 +1,600 @@
+---
+title: "Assignment 7: Artificial Neural Network"
+author: "Hector Ramirez Asturias"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999)
+```
+
+## Introduction
+
+This assignment builds and evaluates an artificial neural network (ANN) for predicting diabetes status in the CanPath Student Dataset, with emphasis on hyperparameter tuning and comparison against a baseline configuration. The outcome is the same binary diabetes indicator used in earlier supervised learning work on this dataset, and the predictor set is the same 13-variable bank drawn from sociodemographic, physical activity, and health status columns. Keeping the outcome and features fixed lets the ANN results be read in the same frame as the tree-based and linear models fit earlier on the same data.
+
+The `brulee` engine is used because it is the torch-backed MLP implementation the course materials build on, and it integrates cleanly with `tidymodels` tuning. SMOTE oversampling is applied inside the recipe to counter the heavy class imbalance in the outcome.
+
+### Goals
+
+- Fit a baseline ANN with default hyperparameters and evaluate it on the test set
+- Tune five ANN hyperparameters via grid search with cross-validation
+- Compare the baseline and tuned configurations on the same metrics
+- Discuss feature importance in the context of a black-box model
+
+## Setup
+
+```{r libraries}
+library(tidyverse)
+library(tidymodels)
+library(brulee)
+library(torch)
+library(themis)
+library(vip)
+library(knitr)
+library(gtsummary)
+library(parallel)
+library(doParallel)
+
+set.seed(10)
+
+cores <- parallel::detectCores()
+```
+
+The first time this analysis is run, `torch::install_torch()` must be executed to install the torch backend. The line below is kept for documentation and is not evaluated on subsequent knits.
+
+```{r torch-install, eval=FALSE}
+torch::install_torch()
+```
+
+## 1. Dataset Exploration
+
+### Load and Examine Data
+
+```{r load-data}
+data <- read_csv("../data/can_path_data.csv")
+
+cat("Dataset dimensions:", nrow(data), "rows x", ncol(data), "columns\n")
+```
+
+### Variable Selection
+
+The thirteen predictors, drawn from the CanPath Student Dataset, are the ones used in earlier supervised learning work on the same outcome:
+
+- **SDC_AGE_CALC**: Age at data collection
+- **SDC_GENDER**: Gender (1 = Male, 2 = Female)
+- **SDC_EDU_LEVEL**: Highest education level
+- **SDC_INCOME**: Household income category
+- **PM_BMI_SR**: Self-reported BMI
+- **HS_GEN_HEALTH**: Self-rated general health
+- **PA_TOTAL_SHORT**: Total physical activity (short form)
+- **WRK_FULL_TIME**: Full-time work status
+- **SMK_CIG_EVER**: Ever smoked cigarettes
+- **HS_ROUTINE_VISIT_EVER**: Ever had a routine medical visit
+- **PSE_ADULT_WRK_DURATION**: Adult work duration
+- **DIS_RESP_SLEEP_APNEA_EVER**: Ever diagnosed with sleep apnea
+- **SDC_EDU_LEVEL_AGE**: Age at highest education level
+
+**Outcome**: **DIS_DIAB_EVER** (ever diagnosed with diabetes).
+
+```{r select-variables}
+selected_vars <- c("DIS_DIAB_EVER", "SDC_AGE_CALC", "SDC_GENDER",
+                   "SDC_EDU_LEVEL", "SDC_INCOME", "PM_BMI_SR",
+                   "HS_GEN_HEALTH", "PA_TOTAL_SHORT", "WRK_FULL_TIME",
+                   "SMK_CIG_EVER", "HS_ROUTINE_VISIT_EVER",
+                   "PSE_ADULT_WRK_DURATION", "DIS_RESP_SLEEP_APNEA_EVER",
+                   "SDC_EDU_LEVEL_AGE")
+
+data_selected <- data %>%
+  select(all_of(selected_vars))
+```
+
+### Data Cleaning
+
+The CanPath dataset uses negative codes (e.g., `-7`) to encode missing or not-applicable responses. These are converted to `NA` before analysis.
+
+```{r clean-negatives}
+data_selected %>%
+  summarise(across(everything(), ~sum(. < 0, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Negative_Count") %>%
+  filter(Negative_Count > 0) %>%
+  kable(caption = "Variables with Negative Coded Values")
+
+data_selected <- data_selected %>%
+  mutate(across(everything(), ~if_else(. < 0, NA_real_, .)))
+```
+
+```{r missing-values}
+missing_summary <- colSums(is.na(data_selected)) %>%
+  as.data.frame() %>%
+  setNames("Missing_Count") %>%
+  rownames_to_column("Variable") %>%
+  mutate(Pct = round(Missing_Count / nrow(data_selected) * 100, 1)) %>%
+  filter(Missing_Count > 0) %>%
+  arrange(desc(Missing_Count))
+
+missing_summary %>% kable(caption = "Missing Values After Cleaning")
+```
+
+### Recode Outcome and Predictors
+
+`DIS_DIAB_EVER` is coded as 0 (never), 1 (ever had), and 2 (presumed never). For binary classification the values 0 and 2 are combined into "No" and 1 becomes "Yes".
+
+```{r recode-variables}
+data_selected <- data_selected %>%
+  mutate(diabetes = case_when(
+    DIS_DIAB_EVER == 0 ~ "No",
+    DIS_DIAB_EVER == 1 ~ "Yes",
+    DIS_DIAB_EVER == 2 ~ "No"
+  )) %>%
+  mutate(diabetes = as.factor(diabetes))
+
+table(data_selected$DIS_DIAB_EVER, data_selected$diabetes, useNA = "ifany")
+
+data_selected$DIS_DIAB_EVER <- NULL
+
+categorical_vars <- c("SDC_GENDER", "SDC_EDU_LEVEL", "SDC_INCOME",
+                      "HS_GEN_HEALTH", "WRK_FULL_TIME", "SMK_CIG_EVER",
+                      "HS_ROUTINE_VISIT_EVER", "DIS_RESP_SLEEP_APNEA_EVER")
+
+data_selected <- data_selected %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+```
+
+### Handle Missing Data
+
+```{r complete-cases}
+n_before <- nrow(data_selected)
+data_clean <- data_selected %>% drop_na()
+n_after <- nrow(data_clean)
+```
+
+**Complete case analysis:** `r n_after` rows retained from `r n_before` (`r n_before - n_after` removed, `r round((n_before - n_after) / n_before * 100, 1)`% loss).
+
+### Exploratory Data Analysis
+
+```{r eda-class-balance, fig.width=6, fig.height=4}
+ggplot(data_clean, aes(x = diabetes, fill = diabetes)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  scale_fill_manual(values = c("No" = "steelblue", "Yes" = "tomato")) +
+  theme_minimal() +
+  labs(title = "Distribution of Diabetes Status",
+       subtitle = "Substantial class imbalance: most participants report no diabetes",
+       x = "Diabetes Status", y = "Count") +
+  theme(legend.position = "none")
+```
+
+The class imbalance is pronounced. A model that predicts "No" for every observation would still appear accurate by overall accuracy, which is why sensitivity is the metric that matters here. SMOTE oversampling is applied inside the recipe to counteract this during training.
+
+```{r eda-summary}
+data_clean %>%
+  select(diabetes, SDC_AGE_CALC, PM_BMI_SR, PA_TOTAL_SHORT, SDC_EDU_LEVEL_AGE) %>%
+  tbl_summary(
+    by = diabetes,
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = all_continuous() ~ 1
+  ) %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_caption("**Predictor Means by Diabetes Status**")
+```
+
+The diabetes group is older on average and has higher BMI.
+
+```{r eda-boxplots, fig.width=10, fig.height=5}
+data_clean %>%
+  select(diabetes, SDC_AGE_CALC, PM_BMI_SR, PA_TOTAL_SHORT) %>%
+  pivot_longer(-diabetes, names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(x = diabetes, y = Value, fill = diabetes)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("No" = "steelblue", "Yes" = "tomato")) +
+  facet_wrap(~Variable, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Continuous Predictors by Diabetes Status",
+       x = "Diabetes", y = "Value") +
+  theme(legend.position = "none")
+```
+
+## 2. Data Splitting and Resampling
+
+A 70/30 stratified split is used. Five-fold cross-validation provides the resampling scheme for hyperparameter tuning.
+
+```{r data-split}
+set.seed(10)
+
+data_split <- initial_split(data_clean, prop = 0.70, strata = diabetes)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+cv_folds <- vfold_cv(train_data, v = 5, strata = diabetes)
+```
+
+**Training set:** `r nrow(train_data)` | **Test set:** `r nrow(test_data)`
+
+## 3. Preprocessing Recipe
+
+ANNs require numeric inputs on a common scale. The recipe dummy-encodes categorical predictors, normalizes all numeric predictors, removes zero-variance columns, and applies SMOTE to the training folds to balance the classes before model fitting.
+
+```{r recipe}
+ann_recipe <-
+  recipe(diabetes ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_smote(diabetes, over_ratio = 0.9)
+```
+
+A shared metric set is defined once so baseline and tuned models report the same numbers.
+
+```{r metrics}
+classification_metrics <- metric_set(accuracy, sens, spec, precision, f_meas, roc_auc)
+```
+
+## 4. Baseline ANN
+
+The baseline uses the `brulee` defaults: a single hidden layer with 3 units, `relu` activation, 100 epochs, no penalty, and a learning rate of 0.01. The model is fit on the full training set (with SMOTE applied through the recipe) and evaluated on the held-out test set.
+
+```{r baseline-spec}
+ann_baseline_spec <- mlp(
+  hidden_units = 3,
+  penalty      = 0,
+  epochs       = 100,
+  activation   = "relu",
+  learn_rate   = 0.01
+) %>%
+  set_engine("brulee", validation = 0) %>%
+  set_mode("classification")
+```
+
+```{r baseline-fit}
+ann_baseline_wf <- workflow() %>%
+  add_model(ann_baseline_spec) %>%
+  add_recipe(ann_recipe)
+
+ann_baseline_fit <- ann_baseline_wf %>%
+  fit(data = train_data)
+```
+
+```{r baseline-eval}
+ann_baseline_pred <- augment(ann_baseline_fit, test_data)
+
+baseline_metrics <- ann_baseline_pred %>%
+  classification_metrics(truth = diabetes, estimate = .pred_class,
+                         .pred_Yes, event_level = "second") %>%
+  mutate(Model = "Baseline ANN")
+
+baseline_metrics %>% kable(caption = "Baseline ANN: Test Set Metrics", digits = 3)
+```
+
+```{r baseline-confmat}
+ann_baseline_pred %>%
+  conf_mat(truth = diabetes, estimate = .pred_class)
+```
+
+The baseline catches roughly two thirds of the diabetes cases (sensitivity 0.68) at the cost of precision around 0.12. That trade is typical for SMOTE-trained models on a heavily imbalanced outcome. The ROC-AUC of 0.76 is the reference point for the tuning step; any tuned configuration that does not clear 0.76 on test data cannot claim an improvement.
+
+## 5. Hyperparameter Tuning: Initial Grid (v1)
+
+Five hyperparameters are tuned: `hidden_units`, `penalty`, `epochs`, `activation`, and `learn_rate`. A space-filling grid of 15 candidate configurations balances exploration and runtime; `brulee` fits quickly enough that a broader grid is feasible if needed. Tuning runs in parallel across the available cores.
+
+```{r tune-spec}
+ann_tune_spec <- mlp(
+  hidden_units = tune(),
+  penalty      = tune(),
+  epochs       = tune(),
+  activation   = tune(),
+  learn_rate   = tune()
+) %>%
+  set_engine("brulee", validation = 0) %>%
+  set_mode("classification")
+
+ann_tune_wf <- workflow() %>%
+  add_model(ann_tune_spec) %>%
+  add_recipe(ann_recipe)
+```
+
+```{r tune-grid}
+set.seed(10)
+
+ann_grid <- grid_space_filling(
+  hidden_units(range = c(3L, 30L)),
+  penalty(range = c(-5, -1)),
+  epochs(range = c(50L, 300L)),
+  activation(values = c("relu", "tanh", "log_sigmoid")),
+  learn_rate(range = c(-3, -1)),
+  size = 15
+)
+
+ann_grid %>% kable(caption = "Hyperparameter Grid", digits = 4)
+```
+
+```{r tune-run, cache=TRUE}
+cl <- makePSOCKcluster(max(1, cores - 1))
+registerDoParallel(cl)
+
+set.seed(10)
+ann_tune_results <- tune_grid(
+  ann_tune_wf,
+  resamples = cv_folds,
+  grid      = ann_grid,
+  metrics   = classification_metrics,
+  control   = control_grid(save_pred = TRUE, verbose = FALSE)
+)
+
+stopCluster(cl)
+```
+
+### Tuning Results
+
+```{r tune-metrics, fig.width=10, fig.height=6}
+collect_metrics(ann_tune_results) %>%
+  filter(.metric %in% c("roc_auc", "sens", "f_meas")) %>%
+  ggplot(aes(x = hidden_units, y = mean, color = activation)) +
+  geom_point(size = 2, alpha = 0.8) +
+  facet_wrap(~.metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Cross-Validated Metrics Across Hyperparameter Grid",
+       x = "Hidden Units", y = "Mean CV Metric", color = "Activation")
+```
+
+```{r tune-top}
+show_best(ann_tune_results, metric = "roc_auc", n = 5) %>%
+  kable(caption = "Top 5 Configurations by ROC-AUC", digits = 4)
+```
+
+```{r tune-best}
+best_ann <- select_best(ann_tune_results, metric = "roc_auc")
+best_ann %>% kable(caption = "Selected Hyperparameters")
+```
+
+The best cross-validated ROC-AUC across the 15 configurations was 0.70, below the 0.76 obtained by the baseline defaults on the test set. This could mean the space-filling grid did not sample densely enough near the defaults and a better configuration was simply never tried. It could also reflect cross-validation variance; on a 29,000-row SMOTE-balanced training set, five-fold AUC estimates carry enough noise that the ranking among the top configurations is not fully reliable. The selected configuration (`hidden_units = 3`, `activation = relu`, `epochs = 85`, `learn_rate ≈ 0.003`, `penalty ≈ 0.004`) sits very close to the baseline architecture, consistent with the baseline already being near-optimal for this data. Section 5b probes this directly with a denser grid.
+
+## 5b. Hyperparameter Tuning: Expanded Grid (v2)
+
+The v1 grid suggested the baseline region is competitive, so the expanded grid tightens ranges toward that region while also probing longer training runs and lower learning rates. The grid size increases from 15 to 40 configurations. The `log_sigmoid` activation was the weakest performer in v1 and is dropped, leaving `relu` and `tanh`. All other mechanics (5-fold CV, SMOTE recipe, parallel workers, metric set) remain identical so the two tuning runs are directly comparable.
+
+```{r tune-spec-v2}
+ann_tune_spec_v2 <- mlp(
+  hidden_units = tune(),
+  penalty      = tune(),
+  epochs       = tune(),
+  activation   = tune(),
+  learn_rate   = tune()
+) %>%
+  set_engine("brulee", validation = 0) %>%
+  set_mode("classification")
+
+ann_tune_wf_v2 <- workflow() %>%
+  add_model(ann_tune_spec_v2) %>%
+  add_recipe(ann_recipe)
+```
+
+```{r tune-grid-v2}
+set.seed(10)
+
+ann_grid_v2 <- grid_space_filling(
+  hidden_units(range = c(2L, 16L)),
+  penalty(range = c(-6, -2)),
+  epochs(range = c(60L, 400L)),
+  activation(values = c("relu", "tanh")),
+  learn_rate(range = c(-3.5, -1.5)),
+  size = 40
+)
+
+ann_grid_v2 %>% kable(caption = "Expanded Hyperparameter Grid (v2)", digits = 4)
+```
+
+```{r tune-run-v2, cache=TRUE}
+cl <- makePSOCKcluster(max(1, cores - 1))
+registerDoParallel(cl)
+
+set.seed(10)
+ann_tune_results_v2 <- tune_grid(
+  ann_tune_wf_v2,
+  resamples = cv_folds,
+  grid      = ann_grid_v2,
+  metrics   = classification_metrics,
+  control   = control_grid(save_pred = TRUE, verbose = FALSE)
+)
+
+stopCluster(cl)
+```
+
+### v2 Tuning Results
+
+```{r tune-metrics-v2, fig.width=10, fig.height=6}
+collect_metrics(ann_tune_results_v2) %>%
+  filter(.metric %in% c("roc_auc", "sens", "f_meas")) %>%
+  ggplot(aes(x = hidden_units, y = mean, color = activation)) +
+  geom_point(size = 2, alpha = 0.8) +
+  facet_wrap(~.metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Cross-Validated Metrics Across Expanded Grid (v2)",
+       x = "Hidden Units", y = "Mean CV Metric", color = "Activation")
+```
+
+```{r tune-top-v2}
+show_best(ann_tune_results_v2, metric = "roc_auc", n = 5) %>%
+  kable(caption = "Top 5 v2 Configurations by ROC-AUC", digits = 4)
+```
+
+```{r tune-best-v2}
+best_ann_v2 <- select_best(ann_tune_results_v2, metric = "roc_auc")
+best_ann_v2 %>% kable(caption = "Selected v2 Hyperparameters")
+```
+
+The v2 best ROC-AUC on cross-validation was 0.72, a small improvement over v1's 0.70. The selected v2 configuration (`hidden_units = 2`, `activation = tanh`, `epochs = 312`, `learn_rate ≈ 0.007`, `penalty ≈ 1.3e-5`) is architecturally smaller than v1's but trains for longer, which is consistent with the idea that the signal in this predictor set is simple enough that a narrow network with extended training captures it as well as a wider one. Whether this closed the gap to the baseline on unseen data is settled in Section 6.
+
+## 6. Final Fit and Comparison
+
+Both tuned configurations are refit on the full training set and evaluated on the held-out test set, alongside the baseline, so the three models can be ranked on the same metrics.
+
+### v1 Tuned Model
+
+```{r final-fit}
+final_ann_wf <- finalize_workflow(ann_tune_wf, best_ann)
+
+final_ann_fit <- final_ann_wf %>%
+  fit(data = train_data)
+
+ann_tuned_pred <- augment(final_ann_fit, test_data)
+```
+
+```{r final-eval}
+tuned_metrics <- ann_tuned_pred %>%
+  classification_metrics(truth = diabetes, estimate = .pred_class,
+                         .pred_Yes, event_level = "second") %>%
+  mutate(Model = "Tuned ANN (v1)")
+
+tuned_metrics %>% kable(caption = "Tuned ANN v1: Test Set Metrics", digits = 3)
+```
+
+```{r final-confmat}
+ann_tuned_pred %>%
+  conf_mat(truth = diabetes, estimate = .pred_class)
+```
+
+### v2 Tuned Model
+
+```{r final-fit-v2}
+final_ann_wf_v2 <- finalize_workflow(ann_tune_wf_v2, best_ann_v2)
+
+final_ann_fit_v2 <- final_ann_wf_v2 %>%
+  fit(data = train_data)
+
+ann_tuned_pred_v2 <- augment(final_ann_fit_v2, test_data)
+```
+
+```{r final-eval-v2}
+tuned_metrics_v2 <- ann_tuned_pred_v2 %>%
+  classification_metrics(truth = diabetes, estimate = .pred_class,
+                         .pred_Yes, event_level = "second") %>%
+  mutate(Model = "Tuned ANN (v2)")
+
+tuned_metrics_v2 %>% kable(caption = "Tuned ANN v2: Test Set Metrics", digits = 3)
+```
+
+```{r final-confmat-v2}
+ann_tuned_pred_v2 %>%
+  conf_mat(truth = diabetes, estimate = .pred_class)
+```
+
+### Three-Way Comparison
+
+```{r comparison-plot, fig.width=10, fig.height=5}
+all_metrics <- bind_rows(baseline_metrics, tuned_metrics, tuned_metrics_v2)
+
+all_metrics %>%
+  select(Model, .metric, .estimate) %>%
+  ggplot(aes(x = .metric, y = .estimate, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.8), alpha = 0.85) +
+  geom_text(aes(label = round(.estimate, 3)),
+            position = position_dodge(width = 0.8), vjust = -0.4, size = 3.0) +
+  scale_fill_manual(values = c("Baseline ANN" = "steelblue",
+                                "Tuned ANN (v1)" = "tomato",
+                                "Tuned ANN (v2)" = "darkgreen")) +
+  theme_minimal() +
+  labs(title = "Baseline vs Tuned ANN (v1, v2) on Test Set",
+       x = "Metric", y = "Estimate") +
+  ylim(0, 1)
+```
+
+```{r comparison-table}
+all_metrics %>%
+  select(Model, .metric, .estimate) %>%
+  pivot_wider(names_from = Model, values_from = .estimate) %>%
+  kable(caption = "Baseline vs Tuned v1 vs Tuned v2: Side-by-Side", digits = 3)
+```
+
+### Selecting the Best Model for Downstream Analysis
+
+```{r select-best-model}
+auc_ranking <- all_metrics %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(.estimate))
+
+auc_ranking %>%
+  select(Model, ROC_AUC = .estimate) %>%
+  kable(caption = "Test ROC-AUC Ranking", digits = 3)
+
+best_model_name <- auc_ranking$Model[1]
+
+best_fit <- switch(best_model_name,
+                   "Baseline ANN"    = ann_baseline_fit,
+                   "Tuned ANN (v1)"  = final_ann_fit,
+                   "Tuned ANN (v2)"  = final_ann_fit_v2)
+
+best_pred <- switch(best_model_name,
+                    "Baseline ANN"    = ann_baseline_pred,
+                    "Tuned ANN (v1)"  = ann_tuned_pred,
+                    "Tuned ANN (v2)"  = ann_tuned_pred_v2)
+```
+
+The model with the highest test ROC-AUC is used for the permutation importance analysis in Section 7. The selected model is: **`r best_model_name`**.
+
+### Interpretation
+
+The baseline retains the highest test ROC-AUC (0.759), with v2 close behind (0.751) and v1 lowest (0.734). Sensitivity tells the same story in the same order (baseline 0.68, v2 0.66, v1 0.60), which is the metric that matters most for a diabetes screening model. The expanded grid in v2 closed most of the gap to the baseline but did not cross it. The v1 run had suggested that a tighter grid might reveal a better configuration; v2 tested that hypothesis and the answer is no. Across both tuning runs and 55 unique configurations, no candidate beat the default brulee hyperparameters on the holdout data.
+
+The ROC-AUC difference between v2 and baseline is 0.008, which is small enough that five-fold cross-validation variance alone could account for it. A larger grid or a Bayesian tuner might eventually find a configuration that edges past baseline, but the expected improvement is marginal. For this dataset, predictor set, and SMOTE-based recipe, the ANN is essentially flat across a wide region of hyperparameter space, and the baseline is the configuration I would keep.
+
+v1 and v2 picked different architectures: v1 settled on a slightly wider ReLU network with short training; v2 settled on a narrower tanh network with long training. Both produced similar ROC-AUC on the test set. Two dissimilar architectures reach the same performance level, which says the ceiling here is set by the predictors rather than by the optimizer.
+
+## 7. Feature Importance in ANNs
+
+Feature importance is not a natural output of a neural network. A fitted ANN is a composition of nonlinear activations over weight matrices; a single predictor's contribution to the output depends on every other predictor's current value and on the path its activation takes through the hidden layer. Unlike a linear model, where coefficients have a direct interpretation, or a Random Forest, where importance can be derived from impurity reduction across splits, an ANN has no intrinsic notion of variable-level contribution.
+
+Two approximations are available. The first is permutation-based importance, where each predictor is shuffled in turn and the resulting drop in performance is used as a score. This approach is model-agnostic and works for any fitted model including `brulee` ANNs, but it measures predictive importance rather than structural importance. The second is weight-based heuristics such as Garson or Olden, which summarise the magnitudes of the connections from input nodes to output. These heuristics are specific to single-hidden-layer architectures, sensitive to weight scaling, and their interpretation remains contested in the literature.
+
+A permutation-based ranking is computed below using the DALEX/iml-style approach manually, since `vip` does not provide a built-in method for `brulee`. The ranking should be read as approximate. The model used here is the one with the highest test ROC-AUC from Section 6.
+
+```{r permutation-importance, fig.width=8, fig.height=5}
+predictors <- setdiff(names(train_data), "diabetes")
+
+baseline_auc <- best_pred %>%
+  roc_auc(truth = diabetes, .pred_Yes, event_level = "second") %>%
+  pull(.estimate)
+
+set.seed(10)
+perm_importance <- map_dfr(predictors, function(var) {
+  permuted <- test_data
+  permuted[[var]] <- sample(permuted[[var]])
+  auc_perm <- augment(best_fit, permuted) %>%
+    roc_auc(truth = diabetes, .pred_Yes, event_level = "second") %>%
+    pull(.estimate)
+  tibble(Variable = var, AUC_drop = baseline_auc - auc_perm)
+})
+
+perm_importance %>%
+  arrange(desc(AUC_drop)) %>%
+  ggplot(aes(x = reorder(Variable, AUC_drop), y = AUC_drop)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = paste0("Permutation Importance: ", best_model_name),
+       subtitle = "AUC drop when predictor is shuffled (higher = more important)",
+       x = NULL, y = "AUC Drop")
+```
+
+The permutation ranking identifies the predictors whose removal from the trained network produces the largest drop in ROC-AUC. Age and BMI lead the ranking, consistent with their position as known diabetes risk factors and with earlier tree-based and regularized logistic results on the same dataset. Sleep apnea and general health appear in the next tier. Predictors with small permutation drops are not necessarily irrelevant; an ANN can encode a predictor's information through its correlation with the remaining inputs, so shuffling a single column may leave the residual signal largely intact. The ranking should therefore be read as "variables the network cannot do without given the rest of the inputs," not as a causal ordering.
+
+## 8. Conclusion
+
+The baseline ANN reached a test ROC-AUC of 0.759 with default brulee hyperparameters, and neither tuning run beat that number. The initial 15-point grid (v1) selected a short-trained ReLU network that traded sensitivity for specificity, the wrong direction for a diabetes screening model. The expanded 40-point grid (v2) closed most of the gap but still fell short by 0.008 on ROC-AUC and by 0.02 on sensitivity. Across 55 unique configurations, the default hyperparameters remain the best choice on unseen data. The two tuning runs mainly serve as verification that the defaults are not leaving performance on the table.
+
+Placed alongside the earlier supervised learning results on the same outcome and predictor set, the ANN does not pull ahead. Random Forest, logistic regression, KNN, regularized logistic regression, and the ANN all produce AUC values in a narrow band, which points to a ceiling imposed by the thirteen predictors rather than by the choice of algorithm. The ANN adds no interpretability over the tree-based and linear alternatives and requires substantially more compute, so for this specific task it is not the model I would carry forward.
+
+Permutation importance places age and BMI at the top of the ranking. The same predictors surface consistently as the dominant signal across different model families, which is the strongest evidence that they carry real predictive information rather than algorithm-specific artefacts. The remaining predictors contribute incrementally; none of them is a risk factor that the neural network uncovers but the simpler models miss.
+
+For clinical use, the ANN's opacity is a harder constraint than its modest performance. A logistic model lets a clinician state that a one-unit increase in BMI changes the log-odds of diabetes by a specific value; the ANN cannot support that statement. Permutation importance narrows the gap but does not close it. In a screening workflow where each flagged patient triggers follow-up testing, the interpretable model is easier to defend. For this dataset the ANN is neither more accurate nor more useful than the models already available.
+
+## References
+
+- Max Kuhn and Julia Silge. *Tidy Modeling with R*. O'Reilly, 2022.
+- `brulee` package documentation: https://brulee.tidymodels.org/
+- Course data work: `walwabilly/Data Work/ann.md`
