@@ -1,0 +1,196 @@
+---
+title: "Assignment 8: Scientific Computing and Big Data Analysis"
+author: "Hector Ramirez Asturias"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999)
+library(tidyverse)
+library(knitr)
+```
+
+## Introduction
+
+This assignment scales a machine learning workflow to a dataset that does not fit comfortably on a laptop. The accelerometer dataset available on the USask Plato HPC cluster contains 22.6 million rows across 13 columns (roughly 2 GB on disk), with activity labels, wear location, tri-axial accelerometer readings, and synchronised metabolic measurements. The model predicts the labelled activity from the accelerometer and metabolic features; a baseline Random Forest, a tuned Random Forest, and a multinomial logistic regression are fitted for comparison.
+
+The scientific computing component centres on moving the entire pipeline off the laptop and onto a shared HPC cluster through a SLURM batch job, rather than on any novel modelling decision.
+
+### Goals
+
+- Connect to the Plato HPC cluster and run a job against a ~2 GB dataset
+- Fit a baseline Random Forest, a tuned Random Forest, and a multinomial logistic regression for comparison
+- Record wall-clock time for data I/O, model fitting, tuning, and prediction
+- Reflect on what HPC adds over a local laptop workflow
+
+## Accessing the Plato HPC Cluster
+
+The cluster is reached over SSH through the USask VPN:
+
+```bash
+ssh lzn538@plato.usask.ca
+```
+
+The login node is `platolgn002`. Home directory is `/home/lzn538`. The course data lives in `/project/chep_fuller/`, readable to members of the `hpc_s_fuller` project group. The R environment is loaded through Lmod modules:
+
+```bash
+module load StdEnv/2023 r/4.5.0
+```
+
+User-installed R packages (`tidyverse`, `tidymodels`, `ranger`, `nnet`, `glmnet`) live under `~/R/x86_64-pc-linux-gnu-library/4.5/`. The first time a package is needed, the script installs it from the MUUG CRAN mirror.
+
+## Dataset
+
+The file `/project/chep_fuller/accel_data_no_id.csv` contains 22,597,892 rows with the following columns of interest:
+
+| Column | Role | Notes |
+|---|---|---|
+| `activity` | outcome | Seven labels observed on the complete-case subset: `Lying`, `Sitting`, `Self Pace walk`, `Running 3 METs`, `Running 5 METs`, `Running 7 METs`, `transit` |
+| `x_axis`, `y_axis` | predictor | Tri-axial accelerometer is reduced to two axes in this file (no `z_axis`) |
+| `wear_location` | predictor | `hand`, `pock`, `back` |
+| `VO2`, `VO2kg`, `VCO2`, `BF`, `MET`, `EE` | predictor | Metabolic measurements; sparse (NA between measurement events) |
+| `participant_id` | excluded | Present, but dropped to avoid identity leakage |
+| `record_time` | excluded | Absolute timestamps are not modelled |
+| `...1` | excluded | Row index artefact from the source file |
+
+A complete-case analysis removes rows where any metabolic measurement is missing. The effective sample is then drawn down to 500,000 rows via stratified sampling on `activity` so the full pipeline (load, clean, split, baseline, tune, comparison) completes within a reasonable SLURM time budget.
+
+## Workflow
+
+Two files drive the analysis on Plato: an R script (`activity_rf.R`) and a SLURM submission script (`activity_rf.slurm`). Both live in `/home/lzn538/` and were transferred from a local development environment with `scp`.
+
+### SLURM Job Script
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=activity_rf
+#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=48G
+#SBATCH --output=activity_rf_%j.out
+#SBATCH --error=activity_rf_%j.err
+#SBATCH --mail-user=lzn538@usask.ca
+#SBATCH --mail-type=END,FAIL
+
+cd /home/lzn538
+module load StdEnv/2023 r/4.5.0
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+srun Rscript activity_rf.R
+```
+
+Resource choices:
+
+- `--cpus-per-task=16` because `ranger` parallelises tree construction well and the 16-core node produces a clear speed-up over a single-threaded fit
+- `--mem=48G` to hold the full 22.6 M-row data frame in memory while the subsample is drawn, with headroom for two ranger forests (one classification, one probability) plus the multinomial model
+- `--time=04:00:00` as a conservative budget given the tuning grid
+- `--mail-type=END,FAIL` so a notification arrives on completion or failure rather than requiring active monitoring
+
+### R Pipeline
+
+The R script is structured in named stages that each record their own wall-clock time:
+
+1. Package check and module-aware core detection (`Sys.getenv("SLURM_CPUS_PER_TASK")`)
+2. Read the full CSV into memory and report I/O time
+3. Clean: keep the nine predictors and the outcome, drop `participant_id`, factorise categoricals, complete-case only
+4. Stratified subsample to 500,000 rows on `activity`
+5. 70/30 stratified train/test split
+6. Baseline Random Forest: `ranger` with `num.trees = 500`, `mtry = floor(sqrt(p))`, fitted twice (once for class prediction, once in probability mode for AUC)
+7. Tuning: manual grid over `mtry` (three values) and `min.node.size` (two values) evaluated on a 20% validation split of the training set with 300 trees per fit
+8. Tuned Random Forest: refit with the best hyperparameters at `num.trees = 500`
+9. Multinomial logistic regression via `nnet::multinom` as a comparison baseline
+10. Save a single `.rds` with every model's metrics, confusion matrix, importance, and timings
+
+## Results
+
+The SLURM job (ID 5128131) completed with exit code 0. Elapsed wall time was 29:40, peak resident memory 20 GB against the 48 GB requested, and all artifacts were copied back to `./artifacts/`. The results bundle is loaded below.
+
+```{r load-results}
+results <- readRDS("artifacts/activity_rf_results.rds")
+```
+
+### Training Time Summary
+
+```{r timing-table}
+tibble(
+  Stage = c("CSV read", "Baseline RF fit",
+            "Tuning grid (6 configs, 300 trees each)",
+            "Tuned RF refit", "Multinomial logistic"),
+  Minutes = c(results$timings$read,
+              results$timings$rf_base,
+              results$timings$rf_tune,
+              results$timings$rf_tuned,
+              results$timings$mlr)
+) %>%
+  kable(digits = 2, caption = "Wall-clock time per stage on 16 Plato CPUs")
+```
+
+Reading the 2 GB CSV with `read_csv` took 0.2 minutes on the login node's fast filesystem, so I/O was never the bottleneck. Model fitting dominated the analysis time, as expected. The gap between this 16-minute analysis total and the 30-minute job elapsed time is accounted for by the first-run package compilation: `tidymodels`, `nnet`, `glmnet`, and their dependencies were not preinstalled and had to be built from source, which takes roughly fifteen minutes on Plato's login node. A second run reusing the installed library would finish closer to sixteen minutes.
+
+### Model Comparison
+
+```{r model-comparison}
+results$all_metrics %>%
+  select(Model, .metric, .estimate) %>%
+  pivot_wider(names_from = Model, values_from = .estimate) %>%
+  kable(digits = 3,
+        caption = "Baseline RF vs Tuned RF vs Multinomial Logistic on test set (150,001 windows)")
+```
+
+The tuned Random Forest reaches 0.890 accuracy, 0.880 macro-F1, and 0.990 weighted macro ROC-AUC on the held-out 30% of the 500,000-row stratified subsample. The baseline reaches 0.885, 0.874, and 0.987 on the same metrics. Tuning adds half a percentage point of accuracy, which is a familiar pattern: Random Forest with reasonable defaults tends to sit close to the performance available on a dataset of this size, and a small grid mostly confirms that rather than shifting the numbers materially.
+
+The multinomial logistic regression reaches 0.526 accuracy, 0.452 macro-F1, and 0.837 ROC-AUC. The gap to the Random Forest is large, at roughly 36 percentage points of accuracy and 43 of macro-F1. The logistic model is not helpless; its ROC-AUC at 0.84 shows it ranks probabilities meaningfully above chance. The failure mode is that a linear decision boundary over nine predictors cannot resolve seven classes whose boundaries are nonlinear and interleaved, and at the default decision threshold it therefore collapses several classes into the majority prediction. The comparison is included to make the gain from the tree-based model visible rather than as a claim that the linear model is the appropriate choice for this task.
+
+### Tuning Grid Outcomes
+
+```{r tune-table}
+results$tune_results %>%
+  arrange(desc(val_accuracy)) %>%
+  kable(digits = 4, caption = "Validation accuracy per hyperparameter configuration")
+```
+
+Best configuration: `mtry = 4`, `min_node_size = 1`, validation accuracy 0.8730. The grid was intentionally small because the baseline was already strong and the marginal improvement from tuning was bounded. Doubling `min_node_size` from 1 to 5 consistently hurt validation accuracy by roughly one percentage point, suggesting the tree-leaf predictions are not suffering from low-sample-size noise that aggressive pruning would help with.
+
+### Confusion Matrix (Tuned Random Forest)
+
+```{r conf-mat}
+results$rf_tuned_cm
+```
+
+Lying, Sitting, and the Running classes are recovered almost perfectly on the test set. The errors concentrate in three places. Self Pace walk is the most internally-confusable class, losing 1,002 windows to Running 3 METs and 1,373 to transit; slow running and walking share a lot of kinematic overlap, and transit (which describes short unstructured movements between tasks) is likely picking up brief stop-and-go segments that look similar. The Running 3/5/7 MET labels also confuse with each other at the boundaries, mostly adjacent intensities rather than across larger intensity gaps. The transit class is the most diffuse and scatters errors across several other classes. None of these errors reverse the overall picture; accuracy per class stays above 0.9 for six of the seven classes.
+
+### Variable Importance
+
+```{r importance, fig.width=7, fig.height=4}
+results$importance %>%
+  mutate(variable = reorder(variable, importance)) %>%
+  ggplot(aes(x = variable, y = importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Variable importance (tuned Random Forest, impurity)",
+       x = NULL, y = "Impurity importance")
+```
+
+The three most informative features are metabolic rather than kinematic: VCO2, EE (energy expenditure), and VO2 top the ranking by a substantial margin. This is physically sensible because the dataset's activity labels are defined in terms of metabolic intensity (3, 5, and 7 MET running), and the metabolic sensors measure that quantity directly. The accelerometer axes (`x_axis`, `y_axis`) sit in the middle of the ranking, followed by the remaining metabolic features (MET, VO2kg, BF), and `wear_location` is last. If the metabolic channels were removed, the problem would be substantially harder; their presence is what pushes the Random Forest above the ninetieth percentile on accuracy.
+
+## Reflection on HPC for Large-Scale Machine Learning
+
+Plato gave the job three things my laptop could not. The 2 GB CSV plus the working copies used for training and evaluation peaked at 20 GB of resident memory, which is more than my 16 GB machine could hold; the 48 GB node was the only place the job would have fitted at all. `ranger` is multi-threaded internally and made direct use of the 16 requested CPUs, compressing what would have been roughly 100 effective minutes of single-threaded tree construction into seven minutes of wall time for the tuning grid alone. The batch-job model removed the need to babysit the run: submit, check email, come back to the results file, rather than keeping an interactive session open for half an hour.
+
+The actual bottleneck in this specific run was neither I/O nor compute. It was R package installation. The `tidymodels` dependency graph pulls in tens of packages that are compiled from source on Plato, because the login nodes do not maintain a shared binary repository for user-space R libraries. Roughly half of the 30-minute elapsed time was spent building those packages. For any subsequent run on the same account, the library is cached at `~/R/x86_64-pc-linux-gnu-library/4.5/` and the overhead disappears; a second run would complete in approximately 16 minutes.
+
+Three adjustments would make the next submission cheaper. Running `install.packages` once on the login node before submitting the first SLURM job removes the compilation overhead from the job's elapsed time, which matters for fair wall-time accounting even if the billed compute remains the same. Reducing `--cpus-per-task` from 16 to 8 is worth benchmarking; `ranger` speeds up sub-linearly with core count past 8, and requesting fewer cores generally reduces queue wait time on shared clusters. Holding only the subsample in memory rather than the full 22.6 M-row frame would drop the memory request from 48 GB to about 8 GB and would widen the set of nodes the job is eligible to run on. None of these would change the modelling results; they affect the scheduling efficiency of future runs.
+
+The central lesson is that the HPC workflow rewards front-loading the setup cost. Package install, data staging, and config sanity-checks all belong outside the metered job, so the SLURM time is spent on the work that actually needs the cluster.
+
+## References
+
+- USask Plato HPC documentation: https://wiki.usask.ca/display/ARC/Plato+HPC+Cluster
+- `ranger` package: Wright, M. N., and A. Ziegler (2017). ranger: A Fast Implementation of Random Forests for High Dimensional Data. Journal of Statistical Software 77(1).
+- Course data work: `walwabilly/Data Work/scientific_computing.md`, `walwabilly/Data Work/full_ml_implementation.md`
